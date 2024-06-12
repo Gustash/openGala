@@ -2,14 +2,17 @@ use bytes::Bytes;
 
 use crate::{
     constants::{CONTENT_URL, DEV_URL},
-    shared::models::api::{BuildOs, GameDetails, GameDetailsResponse, Product, ProductVersion},
+    shared::{
+        errors::FreeCarnivalError,
+        models::api::{BuildOs, GameDetails, GameDetailsResponse, Product, ProductVersion},
+    },
 };
 
 pub(crate) async fn get_build_manifest(
     client: &reqwest::Client,
     product: &Product,
     build_version: &ProductVersion,
-) -> Result<Bytes, reqwest::Error> {
+) -> Result<Bytes, FreeCarnivalError> {
     let res = client
         .get(format!(
             "{}/DevShowCaseSourceVolume/dev_fold_{}/{}/{}/{}_manifest.csv",
@@ -20,16 +23,17 @@ pub(crate) async fn get_build_manifest(
             build_version.version,
         ))
         .send()
-        .await?;
-    let body = res.bytes().await?;
-    Ok(body)
+        .await
+        .map_err(FreeCarnivalError::Request)?;
+
+    res.bytes().await.map_err(FreeCarnivalError::ResponseBody)
 }
 
 pub(crate) async fn get_build_manifest_chunks(
     client: &reqwest::Client,
     product: &Product,
     build_version: &ProductVersion,
-) -> Result<Bytes, reqwest::Error> {
+) -> Result<Bytes, FreeCarnivalError> {
     let res = client
         .get(format!(
             "{}/DevShowCaseSourceVolume/dev_fold_{}/{}/{}/{}_manifest_chunks.csv",
@@ -40,9 +44,10 @@ pub(crate) async fn get_build_manifest_chunks(
             build_version.version,
         ))
         .send()
-        .await?;
-    let body = res.bytes().await?;
-    Ok(body)
+        .await
+        .map_err(FreeCarnivalError::Request)?;
+
+    res.bytes().await.map_err(FreeCarnivalError::ResponseBody)
 }
 
 pub(crate) async fn download_chunk(

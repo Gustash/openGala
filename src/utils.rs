@@ -17,9 +17,12 @@ use crate::{
         read_or_generate_delta_chunks_manifest, read_or_generate_delta_manifest,
         store_build_manifest, verify_file_hash,
     },
-    shared::models::{
-        api::{BuildOs, Product, ProductVersion},
-        BuildManifestRecord, ChangeTag, InstallInfo,
+    shared::{
+        errors::FreeCarnivalError,
+        models::{
+            api::{BuildOs, Product, ProductVersion},
+            BuildManifestRecord, ChangeTag, InstallInfo,
+        },
     },
 };
 
@@ -31,24 +34,16 @@ pub(crate) async fn install<'a>(
     install_opts: InstallOpts,
     version: Option<&ProductVersion>,
     os: Option<BuildOs>,
-) -> Result<Result<(String, Option<InstallInfo>), &'a str>, reqwest::Error> {
-    let library = LibraryConfig::load().expect("Failed to load library");
-    let product = match library.collection.iter().find(|p| p.slugged_name == *slug) {
-        Some(product) => product,
-        None => {
-            return Ok(Err("Could not find game in library"));
-        }
-    };
-
-    let build_version = match version {
-        Some(selected) => selected,
-        None => match product.get_latest_version(os.as_ref()) {
-            Some(latest) => latest,
-            None => {
-                return Ok(Err("Failed to fetch latest build number. Cannot install."));
-            }
-        },
-    };
+) -> Result<(String, Option<InstallInfo>), FreeCarnivalError> {
+    let library = LibraryConfig::load()?;
+    let product = library
+        .collection
+        .iter()
+        .find(|p| p.slugged_name == *slug)
+        .ok_or(FreeCarnivalError::GameNotFound)?;
+    let build_version = version
+        .or_else(|| product.get_latest_version(os.as_ref()))
+        .ok_or(FreeCarnivalError::LatestBuild)?;
     println!("Found game. Installing build version {}...", build_version);
 
     println!("Fetching build manifest...");
@@ -59,15 +54,14 @@ pub(crate) async fn install<'a>(
         &product.slugged_name,
         "manifest",
     )
-    .await
-    .expect("Failed to save build manifest");
+    .await?;
 
     if install_opts.info {
         let mut build_manifest_rdr = csv::Reader::from_reader(&build_manifest[..]);
         let download_size = build_manifest_rdr
             .byte_records()
             .map(|r| {
-                let mut record = r.expect("Failed to get byte record");
+                let mut record = r?;
                 record.push_field(b"");
                 record.deserialize::<BuildManifestRecord>(None)
             })
@@ -79,7 +73,7 @@ pub(crate) async fn install<'a>(
         let mut buf = String::new();
         buf.push_str(&format!("Download Size: {}", human_bytes(download_size)));
         buf.push_str(&format!("\nDisk Size: {}", human_bytes(download_size)));
-        return Ok(Ok((buf, None)));
+        return Ok((buf, None));
     }
 
     println!("Fetching build manifest chunks...");
@@ -91,8 +85,7 @@ pub(crate) async fn install<'a>(
         &product.slugged_name,
         "manifest_chunks",
     )
-    .await
-    .expect("Failed to save build manifest chunks");
+    .await?;
 
     let product_arc = Arc::new(product.clone());
     let os_arc = Arc::new(build_version.os.to_owned());
@@ -107,36 +100,35 @@ pub(crate) async fn install<'a>(
         install_path.into(),
         install_opts,
     )
-    .await
-    .expect("Failed to build from manifest");
+    .await?;
 
-    match result {
-        true => {
-            let install_info = InstallInfo::new(
-                install_path.to_owned(),
-                build_version.version.to_owned(),
-                build_version.os.to_owned(),
-            );
-            Ok(Ok((
-                format!("Successfully installed {} ({})", slug, build_version),
-                Some(install_info),
-            )))
-        }
-        false => Ok(Err(
-            "Some chunks failed verification. Failed to install game.",
-        )),
+    if !result {
+        return Err(FreeCarnivalError::Verify.into());
     }
+
+    let install_info = InstallInfo::new(
+        install_path.to_owned(),
+        build_version.version.to_owned(),
+        build_version.os.to_owned(),
+    );
+    Ok((
+        format!("Successfully installed {} ({})", slug, build_version),
+        Some(install_info),
+    ))
 }
 
-pub(crate) async fn uninstall(install_path: &PathBuf) -> tokio::io::Result<()> {
-    tokio::fs::remove_dir_all(install_path).await
+pub(crate) async fn uninstall(install_path: &PathBuf) -> Result<(), FreeCarnivalError> {
+    tokio::fs::remove_dir_all(install_path)
+        .await
+        .map_err(FreeCarnivalError::RemoveDir)
 }
 
 pub(crate) async fn check_updates(
     library: LibraryConfig,
     installed: InstalledConfig,
-) -> tokio::io::Result<HashMap<String, String>> {
+) -> HashMap<String, String> {
     let mut available_updates = HashMap::new();
+
     for (slug, info) in installed {
         println!("Checking if {slug} has updates...");
         let product = match library.collection.iter().find(|p| p.slugged_name == slug) {
@@ -158,7 +150,8 @@ pub(crate) async fn check_updates(
             available_updates.insert(slug, latest_version.version.to_owned());
         }
     }
-    Ok(available_updates)
+
+    available_updates
 }
 
 pub(crate) async fn update(
@@ -168,7 +161,7 @@ pub(crate) async fn update(
     install_opts: InstallOpts,
     install_info: &InstallInfo,
     selected_version: Option<&ProductVersion>,
-) -> tokio::io::Result<(String, Option<InstallInfo>)> {
+) -> Result<(String, Option<InstallInfo>), FreeCarnivalError> {
     let product = match library.collection.iter().find(|p| &p.slugged_name == slug) {
         Some(p) => p,
         None => {
@@ -241,10 +234,7 @@ pub(crate) async fn update(
         let mut delta_build_manifest_rdr = csv::Reader::from_reader(&delta_manifest[..]);
         let download_size = delta_build_manifest_rdr
             .byte_records()
-            .map(|r| {
-                r.expect("Failed to get byte record")
-                    .deserialize::<BuildManifestRecord>(None)
-            })
+            .map(|r| r?.deserialize::<BuildManifestRecord>(None))
             .fold(0f64, |acc, record| match record {
                 Ok(record) => match record.tag {
                     Some(ChangeTag::Removed) => acc,
@@ -256,7 +246,7 @@ pub(crate) async fn update(
         let disk_size = new_build_manifest_rdr
             .byte_records()
             .map(|r| {
-                let mut record = r.expect("Failed to get byte record");
+                let mut record = r?;
                 record.push_field(b"");
                 record.deserialize::<BuildManifestRecord>(None)
             })
@@ -269,7 +259,7 @@ pub(crate) async fn update(
         let old_disk_size = old_manifest_rdr
             .byte_records()
             .map(|r| {
-                let mut record = r.expect("Failed to get byte record");
+                let mut record = r?;
                 record.push_field(b"");
                 record.deserialize::<BuildManifestRecord>(None)
             })
@@ -321,7 +311,7 @@ pub(crate) async fn launch(
     #[cfg(not(target_os = "windows"))] wine_bin: Option<PathBuf>,
     #[cfg(not(target_os = "windows"))] wine_prefix: Option<PathBuf>,
     wrapper: Option<PathBuf>,
-) -> tokio::io::Result<Option<ExitStatus>> {
+) -> Result<Option<ExitStatus>, FreeCarnivalError> {
     let os = &install_info.os;
 
     #[cfg(not(target_os = "windows"))]
@@ -428,12 +418,10 @@ pub(crate) async fn launch(
     };
     let binary = if wrapper_vec.len() > 0 {
         wrapper_vec[0].to_owned()
+    } else if should_use_wine {
+        wine_bin.unwrap().to_str().unwrap().to_owned()
     } else {
-        if should_use_wine {
-            wine_bin.unwrap().to_str().unwrap().to_owned()
-        } else {
-            exe.to_str().unwrap().to_owned()
-        }
+        exe.to_str().unwrap().to_owned()
     };
 
     let mut command = tokio::process::Command::new(binary);
@@ -454,14 +442,25 @@ pub(crate) async fn launch(
         command.env("WINEPREFIX", wine_prefix);
     }
     println!("{} is the CWD", install_path);
-    let mut child = command.current_dir(install_path.to_pathbuf()).spawn()?;
+    let mut child = match command.current_dir(install_path.to_pathbuf()).spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            return Err(FreeCarnivalError::Command(command, err));
+        }
+    };
 
-    let status = child.wait().await?;
+    let status = child
+        .wait()
+        .await
+        .map_err(|err| FreeCarnivalError::Command(command, err))?;
 
     Ok(Some(status))
 }
 
-pub(crate) async fn verify(slug: &String, install_info: &InstallInfo) -> tokio::io::Result<bool> {
+pub(crate) async fn verify(
+    slug: &String,
+    install_info: &InstallInfo,
+) -> Result<bool, FreeCarnivalError> {
     let mut handles: Vec<JoinHandle<bool>> = vec![];
 
     let build_manifest = read_build_manifest(&install_info.version, slug, "manifest").await?;
@@ -469,18 +468,21 @@ pub(crate) async fn verify(slug: &String, install_info: &InstallInfo) -> tokio::
     let build_manifest_byte_records = build_manifest_rdr.byte_records();
 
     for record in build_manifest_byte_records {
-        let mut record = record.expect("Failed to get byte record");
+        let mut record = record.map_err(FreeCarnivalError::ReadManifest)?;
         record.push_field(b"");
         let record = record
             .deserialize::<BuildManifestRecord>(None)
-            .expect("Failed to deserialize build manifest");
+            .map_err(FreeCarnivalError::ReadManifest)?;
 
         if record.is_directory() {
             continue;
         }
 
         let file_path = OsPath::from(install_info.install_path.join(&record.file_name));
-        if !tokio::fs::try_exists(&file_path).await? {
+        if !tokio::fs::try_exists(&file_path)
+            .await
+            .map_err(|err| FreeCarnivalError::FileNotFound(file_path.to_pathbuf(), err))?
+        {
             println!("{} is missing", record.file_name);
             return Ok(false);
         }
@@ -499,7 +501,7 @@ pub(crate) async fn verify(slug: &String, install_info: &InstallInfo) -> tokio::
 
     let mut result = true;
     for handle in handles {
-        if !handle.await? {
+        if !handle.await.map_err(FreeCarnivalError::Task)? {
             result = false;
             break;
         }

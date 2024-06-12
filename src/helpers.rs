@@ -21,9 +21,12 @@ use crate::{
     api,
     cli::InstallOpts,
     constants::{MAX_CHUNK_SIZE, PROJECT_NAME},
-    shared::models::{
-        api::{BuildOs, Product},
-        BuildManifestChunksRecord, BuildManifestRecord, ChangeTag,
+    shared::{
+        errors::FreeCarnivalError,
+        models::{
+            api::{BuildOs, Product},
+            BuildManifestChunksRecord, BuildManifestRecord, ChangeTag,
+        },
     },
 };
 
@@ -87,7 +90,7 @@ pub(crate) async fn read_or_generate_delta_manifest(
     new_manifest_bytes: &[u8],
     old_version: &String,
     new_version: &String,
-) -> tokio::io::Result<Vec<u8>> {
+) -> Result<Vec<u8>, FreeCarnivalError> {
     let manifest_delta_version = format!("{}_{}", old_version, new_version);
     if let Ok(exising_delta) =
         read_build_manifest(&manifest_delta_version, slug, "manifest_delta").await
@@ -187,7 +190,7 @@ pub(crate) async fn read_or_generate_delta_chunks_manifest(
     new_manifest_bytes: &[u8],
     old_version: &String,
     new_version: &String,
-) -> tokio::io::Result<Vec<u8>> {
+) -> Result<Vec<u8>, FreeCarnivalError> {
     let manifest_delta_version = format!("{}_{}", old_version, new_version);
     if let Ok(exising_delta) =
         read_build_manifest(&manifest_delta_version, slug, "manifest_delta_chunks").await
@@ -274,27 +277,33 @@ pub(crate) async fn store_build_manifest(
     build_number: &String,
     product_slug: &String,
     file_suffix: &str,
-) -> tokio::io::Result<()> {
+) -> Result<(), FreeCarnivalError> {
     let project = ProjectDirs::from("rs", "", *PROJECT_NAME).unwrap();
     let path = project.config_dir().join("manifests").join(product_slug);
-    tokio::fs::create_dir_all(&path).await?;
+    tokio::fs::create_dir_all(&path)
+        .await
+        .map_err(FreeCarnivalError::CreateDir)?;
 
     let path = path.join(format!("{}_{}.csv", build_number, file_suffix));
-    tokio::fs::write(path, body).await
+    tokio::fs::write(path, body)
+        .await
+        .map_err(FreeCarnivalError::WriteFile)
 }
 
 pub(crate) async fn read_build_manifest(
     build_number: &String,
     product_slug: &String,
     file_suffix: &str,
-) -> tokio::io::Result<Vec<u8>> {
+) -> Result<Vec<u8>, FreeCarnivalError> {
     let project = ProjectDirs::from("rs", "", *PROJECT_NAME).unwrap();
     let path = project
         .config_dir()
         .join("manifests")
         .join(product_slug)
         .join(format!("{}_{}.csv", build_number, file_suffix));
-    tokio::fs::read(path).await
+    tokio::fs::read(path)
+        .await
+        .map_err(FreeCarnivalError::ReadFile)
 }
 
 pub(crate) async fn build_from_manifest(
@@ -305,12 +314,14 @@ pub(crate) async fn build_from_manifest(
     build_manifest_chunks_bytes: &[u8],
     install_path: OsPath,
     install_opts: InstallOpts,
-) -> tokio::io::Result<bool> {
+) -> Result<bool, FreeCarnivalError> {
     let mut write_queue = queue![];
     let mut chunk_queue = queue![];
 
     // Create install directory if it doesn't exist
-    tokio::fs::create_dir_all(&install_path).await?;
+    tokio::fs::create_dir_all(&install_path)
+        .await
+        .map_err(FreeCarnivalError::CreateDir)?;
 
     let mut file_chunk_num_map = HashMap::new();
     let mut total_bytes = 0u64;
@@ -341,7 +352,9 @@ pub(crate) async fn build_from_manifest(
                 if file_path.exists() && file_path.to_path().is_dir() {
                     println!("Deleting {}", file_path);
                     // Delete this directory
-                    tokio::fs::remove_dir_all(file_path).await?;
+                    tokio::fs::remove_dir_all(file_path)
+                        .await
+                        .map_err(FreeCarnivalError::RemoveDir)?;
                 }
                 continue;
             }
@@ -350,7 +363,9 @@ pub(crate) async fn build_from_manifest(
             if file_path.exists() && file_path.is_file() {
                 println!("Deleting {}", file_path);
                 // Delete this file
-                tokio::fs::remove_file(file_path).await?;
+                tokio::fs::remove_file(file_path)
+                    .await
+                    .map_err(FreeCarnivalError::RemoveFile)?;
             }
 
             if record.tag == Some(ChangeTag::Removed) {
@@ -532,7 +547,7 @@ pub(crate) async fn build_from_manifest(
     }
 
     println!("Waiting for write thread to finish...");
-    write_handler.await?;
+    write_handler.await.map_err(FreeCarnivalError::Task)?;
 
     #[cfg(target_os = "macos")]
     if *os == BuildOs::Mac {
@@ -563,17 +578,21 @@ pub(crate) async fn prepare_file(
     file_name: &String,
     is_directory: bool,
     #[cfg(target_os = "macos")] mac_executable: &mut mac::MacAppExecutables,
-) -> tokio::io::Result<()> {
+) -> Result<(), FreeCarnivalError> {
     let file_path = base_install_path.join(file_name);
 
     // File is a directory. We should create this directory.
     if is_directory {
         if !file_path.exists() {
-            tokio::fs::create_dir(&file_path).await?;
+            tokio::fs::create_dir(&file_path)
+                .await
+                .map_err(FreeCarnivalError::CreateDir)?;
         }
     } else {
         // Create empty file.
-        tokio::fs::File::create(&file_path).await?;
+        tokio::fs::File::create(&file_path)
+            .await
+            .map_err(FreeCarnivalError::CreateFile)?;
     }
 
     #[cfg(target_os = "macos")]

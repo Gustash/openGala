@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use crate::cli::Cli;
 use crate::config::GalaConfig;
+use crate::shared::errors::FreeCarnivalError;
 use crate::{api::auth, config::InstalledConfig};
 use api::GalaClient;
 use clap::Parser;
@@ -20,64 +21,52 @@ mod shared;
 mod utils;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), FreeCarnivalError> {
     let args = Cli::parse();
-    let CookieConfig(cookie_store) = CookieConfig::load().expect("Failed to load cookie store");
+
+    let CookieConfig(cookie_store) = CookieConfig::load()?;
     let cookie_store = Arc::new(CookieStoreMutex::new(cookie_store));
-    let client = reqwest::Client::with_gala(&cookie_store);
+    let client = reqwest::Client::with_gala(cookie_store.clone());
 
     if args.needs_sync() {
         println!("Syncing library...");
-        match api::auth::sync(&client).await {
-            Ok(Some(result)) => save_user_info(&result),
-            Ok(None) => {
-                println!("Failed to sync: your authentication is invalid.");
-                return;
-            }
-            Err(err) => {
-                println!("Failed to sync: {err:#?}");
-                return;
-            }
-        };
+        let result = api::auth::sync(&client)
+            .await?
+            .ok_or(FreeCarnivalError::Auth)?;
+        save_user_info(&result);
     }
 
     match args.command {
         Commands::Login { email, password } => {
             let password = match password {
                 Some(password) => password,
-                None => {
-                    rpassword::prompt_password("Password: ").expect("Failed to read from stdin")
-                }
+                None => rpassword::prompt_password("Password: ")
+                    .map_err(FreeCarnivalError::StdinPassword)?,
             };
 
-            match auth::login(&client, &email, &password).await {
-                Ok(Some(LoginResult { message, status })) => {
-                    if status != "success" {
-                        println!("Login failed: {}", message);
-                        return;
-                    }
+            let LoginResult { status, message } = auth::login(&client, &email, &password)
+                .await?
+                .ok_or(FreeCarnivalError::LoginParse)?;
 
-                    match auth::sync(&client).await {
-                        Ok(Some(result)) => save_user_info(&result),
-                        Ok(None) => {
-                            println!("Failed to sync: your authentication is invalid.");
-                        }
-                        Err(err) => println!("Failed to sync: {err:#?}"),
-                    };
-                }
-                Ok(None) => {
-                    println!("Failed to parse login response");
-                }
-                Err(err) => println!("Failed to login: {err:#?}"),
+            if status != "success" {
+                return Err(FreeCarnivalError::Login(message));
             }
+
+            let result = api::auth::sync(&client)
+                .await?
+                .ok_or(FreeCarnivalError::Auth)?;
+            save_user_info(&result);
         }
         Commands::Logout => {
-            UserConfig::clear().expect("Error clearing user config");
-            LibraryConfig::clear().expect("Error clearing library");
-            cookie_store.lock().unwrap().clear();
+            UserConfig::clear()?;
+            LibraryConfig::clear()?;
+            cookie_store
+                .lock()
+                .map_err(|err| FreeCarnivalError::ClearCookies(err.to_string().into()))?
+                .clear();
         }
         Commands::Library => {
-            let library = LibraryConfig::load().expect("Failed to load library");
+            let library = LibraryConfig::load()?;
             for product in library.collection {
                 println!("{}", product);
             }
@@ -90,10 +79,9 @@ async fn main() {
             os,
             install_opts,
         } => {
-            let mut installed = InstalledConfig::load().expect("Failed to load installed");
+            let mut installed = InstalledConfig::load()?;
             if installed.contains_key(&slug) && !install_opts.info {
-                println!("{slug} already installed.");
-                return;
+                return Err(FreeCarnivalError::AlreadyInstalled(slug));
             }
 
             let install_path = match (path, base_path) {
@@ -102,32 +90,36 @@ async fn main() {
                 (None, None) => DEFAULT_BASE_INSTALL_PATH.join(&slug),
             };
 
-            let library = LibraryConfig::load().expect("Failed to load library");
-            let selected_version = match (
-                version,
-                library.collection.iter().find(|p| p.slugged_name == slug),
-            ) {
-                (Some(version), Some(product)) => {
-                    match product.version.iter().find(|v| {
-                        v.version == version
-                            && match &os {
-                                Some(target) => v.os == *target,
-                                None => true,
-                            }
-                    }) {
-                        Some(version) => Some(version),
-                        None => {
-                            println!("Can't find or install build {version} for {slug}");
-                            return;
-                        }
-                    }
+            let library = LibraryConfig::load()?;
+
+            // TODO: Move to function
+            let selected_version = match version {
+                Some(version) => {
+                    let product = library
+                        .collection
+                        .iter()
+                        .find(|p| p.slugged_name == slug)
+                        .ok_or(FreeCarnivalError::GameNotFound)?;
+                    let product_version = product
+                        .version
+                        .iter()
+                        .find(|v| {
+                            v.version == version
+                                && match &os {
+                                    Some(target) => v.os == *target,
+                                    None => true,
+                                }
+                        })
+                        .ok_or(FreeCarnivalError::InstallBuild {
+                            version,
+                            slug: slug.clone(),
+                        })?;
+
+                    Some(product_version)
                 }
-                (_, None) => {
-                    println!("{slug} is not in your library");
-                    return;
-                }
-                _ => None,
+                None => None,
             };
+
             match utils::install(
                 client.clone(),
                 &slug,
@@ -136,113 +128,80 @@ async fn main() {
                 selected_version,
                 os,
             )
-            .await
+            .await?
             {
-                Ok(Ok((info, Some(install_info)))) => {
+                (info, Some(install_info)) => {
                     println!("{}", info);
 
                     installed.insert(slug, install_info);
-                    installed
-                        .store()
-                        .expect("Failed to update installed config");
+                    installed.store()?;
                 }
-                Ok(Ok((info, None))) => {
+                (info, None) => {
                     println!("{}", info);
-                }
-                Ok(Err(err)) => {
-                    println!("Failed to install {}: {:?}", &slug, err);
-                }
-                Err(err) => {
-                    println!("Failed to install {}: {:?}", &slug, err);
                 }
             };
         }
         Commands::Uninstall { slug, keep } => {
             let mut installed = InstalledConfig::load().expect("Failed to load installed");
-            let install_info = match installed.remove(&slug) {
-                Some(info) => info,
-                None => {
-                    println!("{slug} is not installed.");
-                    return;
-                }
-            };
+            let install_info = installed
+                .remove(&slug)
+                .ok_or(FreeCarnivalError::NotInstalled(slug.clone()))?;
 
-            let folder_removed = if keep {
-                false
-            } else {
-                match utils::uninstall(&install_info.install_path).await {
-                    Ok(()) => true,
-                    Err(err) => {
-                        println!("Failed to uninstall {slug}: {:?}", err);
-                        false
-                    }
-                }
-            };
-            installed
-                .store()
-                .expect("Failed to update installed config");
+            if !keep {
+                utils::uninstall(&install_info.install_path).await?;
+            }
+            installed.store()?;
             println!(
                 "{slug} uninstalled successfuly. {} was {}.",
                 install_info.install_path.display(),
-                if folder_removed {
-                    "removed"
-                } else {
-                    "not removed"
-                }
+                if keep { "not removed" } else { "removed" }
             );
         }
         Commands::ListUpdates => {
-            let installed = InstalledConfig::load().expect("Failed to load installed");
-            let library = LibraryConfig::load().expect("Failed to load library");
+            let installed = InstalledConfig::load()?;
+            let library = LibraryConfig::load()?;
 
-            match utils::check_updates(library, installed).await {
-                Ok(available_updates) => {
-                    if available_updates.is_empty() {
-                        println!("No available updates");
-                        return;
-                    }
+            let available_updates = utils::check_updates(library, installed).await;
 
-                    for (slug, latest_version) in available_updates {
-                        println!("{slug} has an update -> {latest_version}");
-                    }
-                }
-                Err(err) => {
-                    println!("Failed to check for updates: {:?}", err);
-                }
-            };
+            if available_updates.is_empty() {
+                println!("No available updates");
+                return Ok(());
+            }
+
+            for (slug, latest_version) in available_updates {
+                println!("{slug} has an update -> {latest_version}");
+            }
         }
         Commands::Update {
             slug,
             version,
             install_opts,
         } => {
-            let mut installed = InstalledConfig::load().expect("Failed to load installed");
-            let install_info = match installed.remove(&slug) {
-                Some(info) => info,
-                None => {
-                    println!("{slug} is not installed.");
-                    return;
-                }
-            };
+            let mut installed = InstalledConfig::load()?;
+            let install_info = installed
+                .remove(&slug)
+                .ok_or(FreeCarnivalError::NotInstalled(slug.clone()))?;
             let library = LibraryConfig::load().expect("Failed to load library");
-            let selected_version = match (
-                version,
-                library.collection.iter().find(|p| p.slugged_name == slug),
-            ) {
-                (Some(version), Some(product)) => {
-                    match product.version.iter().find(|v| v.version == version) {
-                        Some(version) => Some(version),
-                        None => {
-                            println!("Couldn't find build {version} for {slug}");
-                            return;
-                        }
-                    }
+
+            let selected_version = match version {
+                Some(version) => {
+                    let product = library
+                        .collection
+                        .iter()
+                        .find(|p| p.slugged_name == slug)
+                        .ok_or(FreeCarnivalError::GameNotFound)?;
+                    let product_version = product
+                        .version
+                        .iter()
+                        .find(|v| v.version == version)
+                        .ok_or(FreeCarnivalError::InstallBuild {
+                            version,
+                            slug: slug.clone(),
+                        })?;
+
+                    Some(product_version)
                 }
-                (_, None) => {
-                    println!("{slug} is not in your library");
-                    return;
-                }
-                _ => None,
+                None => None,
             };
 
             match utils::update(
@@ -253,20 +212,17 @@ async fn main() {
                 &install_info,
                 selected_version,
             )
-            .await
+            .await?
             {
-                Ok((info, Some(install_info))) => {
+                (info, Some(install_info)) => {
                     println!("{}", info);
                     installed.insert(slug, install_info);
                     installed
                         .store()
                         .expect("Failed to update installed config");
                 }
-                Ok((info, None)) => {
+                (info, None) => {
                     println!("{}", info);
-                }
-                Err(err) => {
-                    println!("Failed to update {slug}: {:?}", err);
                 }
             };
         }
@@ -280,22 +236,17 @@ async fn main() {
             no_wine,
             wrapper,
         } => {
-            let installed = InstalledConfig::load().expect("Failed to load installed");
-            let library = LibraryConfig::load().expect("Failed to load library");
-            let install_info = match installed.get(&slug) {
-                Some(info) => info,
-                None => {
-                    println!("{slug} is not installed");
-                    return;
-                }
-            };
-            let product = match library.collection.iter().find(|p| p.slugged_name == slug) {
-                Some(prod) => prod,
-                None => {
-                    println!("Couldn't find {slug} in library");
-                    return;
-                }
-            };
+            let installed = InstalledConfig::load()?;
+            let library = LibraryConfig::load()?;
+            let install_info = installed
+                .get(&slug)
+                .ok_or(FreeCarnivalError::NotInstalled(slug.clone()))?;
+            let product = library
+                .collection
+                .iter()
+                .find(|p| p.slugged_name == slug)
+                .ok_or(FreeCarnivalError::GameNotFound)?;
+
             match utils::launch(
                 &client,
                 product,
@@ -308,30 +259,25 @@ async fn main() {
                 wine_prefix,
                 wrapper,
             )
-            .await
+            .await?
             {
-                Ok(Some(status)) => {
+                Some(status) => {
                     println!("Process exited with: {}", status);
                 }
-                Ok(None) => {
+                None => {
                     println!("Failed to launch {slug}");
-                }
-                Err(err) => {
-                    println!("Failed to launch {}: {:?}", slug, err);
                 }
             };
         }
         Commands::Info { slug } => {
-            let library = LibraryConfig::load().expect("Failed to load library");
-            let product = match library.collection.iter().find(|p| p.slugged_name == slug) {
-                Some(p) => p,
-                None => {
-                    println!("{slug} is not in your library");
-                    return;
-                }
-            };
+            let library = LibraryConfig::load()?;
+            let product = library
+                .collection
+                .iter()
+                .find(|p| p.slugged_name == slug)
+                .ok_or(FreeCarnivalError::GameNotFound)?;
 
-            let installed = InstalledConfig::load().expect("Failed to load installed");
+            let installed = InstalledConfig::load()?;
             let install_info = installed.get(&slug);
 
             println!(
@@ -345,37 +291,27 @@ async fn main() {
             );
         }
         Commands::Verify { slug } => {
-            let installed = InstalledConfig::load().expect("Failed to load installed");
-            let install_info = match installed.get(&slug) {
-                Some(info) => info,
-                None => {
-                    println!("{slug} is not installed.");
-                    return;
-                }
-            };
+            let installed = InstalledConfig::load()?;
+            let install_info = installed
+                .get(&slug)
+                .ok_or(FreeCarnivalError::NotInstalled(slug.clone()))?;
 
-            match utils::verify(&slug, install_info).await {
-                Ok(true) => {
-                    println!("{slug} passed verification.");
-                }
-                Ok(false) => {
-                    println!("{slug} is corrupted. Please reinstall.");
-                }
-                Err(err) => {
-                    println!("Failed to verify files: {}", err);
-                }
+            if utils::verify(&slug, install_info).await? {
+                println!("{slug} passed verification.");
+            } else {
+                println!("{slug} is corrupted. Please reinstall.");
             }
         }
     };
 
     drop(client);
-    let cookie_store = Arc::try_unwrap(cookie_store).expect("Failed to unwrap cookie store");
+    let cookie_store = Arc::try_unwrap(cookie_store).unwrap();
     let cookie_store = cookie_store
         .into_inner()
-        .expect("Failed to unwrap CookieStoreMutex");
-    CookieConfig(cookie_store)
-        .store()
-        .expect("Failed to save cookie config");
+        .map_err(|err| FreeCarnivalError::SaveCookies(err.into()))?;
+    CookieConfig(cookie_store).store()?;
+
+    Ok(())
 }
 
 fn save_user_info(

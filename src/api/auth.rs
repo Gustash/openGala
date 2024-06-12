@@ -1,21 +1,25 @@
 use crate::{
     config::{LibraryConfig, UserConfig},
     constants::BASE_URL,
-    shared::models::api::{LoginResult, SyncResult, UserInfo, UserInfoShowcaseContent},
+    shared::{
+        errors::FreeCarnivalError,
+        models::api::{LoginResult, SyncResult, UserInfo, UserInfoShowcaseContent},
+    },
 };
 
 pub(crate) async fn login(
     client: &reqwest::Client,
     username: &String,
     password: &String,
-) -> Result<Option<LoginResult>, reqwest::Error> {
+) -> Result<Option<LoginResult>, FreeCarnivalError> {
     let params = [("usre", username), ("usrp", password)];
     let res = client
         .post(format!("{}/login_new/gcl", *BASE_URL))
         .form(&params)
         .send()
-        .await?;
-    let body = res.text().await?;
+        .await
+        .map_err(FreeCarnivalError::Request)?;
+    let body = res.text().await.map_err(FreeCarnivalError::ResponseBody)?;
 
     match serde_json::from_str::<LoginResult>(&body) {
         Ok(login) => Ok(Some(login)),
@@ -23,13 +27,16 @@ pub(crate) async fn login(
     }
 }
 
-pub(crate) async fn sync(client: &reqwest::Client) -> Result<Option<SyncResult>, reqwest::Error> {
+pub(crate) async fn sync(
+    client: &reqwest::Client,
+) -> Result<Option<SyncResult>, FreeCarnivalError> {
     let res = client
         .get(format!("{}/login_new/user_info", *BASE_URL))
         .send()
-        .await?;
+        .await
+        .map_err(FreeCarnivalError::Request)?;
 
-    let body = res.text().await?;
+    let body = res.text().await.map_err(FreeCarnivalError::ResponseBody)?;
 
     match serde_json::from_str::<UserInfo>(&body) {
         Ok(user_info) => {

@@ -1,16 +1,17 @@
 use std::collections::HashMap;
 
-use confy::ConfyError;
 use reqwest_cookie_store::CookieStore;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::{
-    constants::CONFIG_PATH,
-    constants::PROJECT_NAME,
-    shared::models::{
-        api::{Product, UserInfo},
-        InstallInfo,
+    constants::{CONFIG_PATH, PROJECT_NAME},
+    shared::{
+        errors::FreeCarnivalError,
+        models::{
+            api::{Product, UserInfo},
+            InstallInfo,
+        },
     },
 };
 
@@ -18,16 +19,19 @@ pub(crate) trait GalaConfig
 where
     Self: Sized + Serialize + DeserializeOwned + Default,
 {
-    fn load() -> Result<Self, ConfyError> {
+    fn load() -> Result<Self, FreeCarnivalError> {
         confy::load_path::<Self>(Self::get_config_path())
+            .map_err(|err| FreeCarnivalError::LoadConfig(Self::config_name(), err))
     }
 
-    fn store(&self) -> Result<(), ConfyError> {
+    fn store(&self) -> Result<(), FreeCarnivalError> {
         confy::store_path(Self::get_config_path(), self)
+            .map_err(|err| FreeCarnivalError::SaveConfig(Self::config_name(), err))
     }
 
-    fn clear() -> Result<(), ConfyError> {
+    fn clear() -> Result<(), FreeCarnivalError> {
         confy::store_path(Self::get_config_path(), Self::default())
+            .map_err(|err| FreeCarnivalError::ClearConfig(Self::config_name(), err))
     }
 
     fn config_name() -> &'static str;
